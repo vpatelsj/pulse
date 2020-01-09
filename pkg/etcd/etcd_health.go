@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"os"
+	"regexp"
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/pkg/transport"
@@ -23,6 +24,12 @@ type EtcdHealthCheck struct {
 	CertKeyFile string
 	Endpoints   []string
 	Logger      *logrus.Logger
+}
+
+type NodeInfo struct {
+	name   string
+	etcdIP string
+	kubeIP string
 }
 
 func (e *EtcdHealthCheck) RunE(cmd *cobra.Command, _ []string) error {
@@ -56,12 +63,28 @@ func (e *EtcdHealthCheck) RunE(cmd *cobra.Command, _ []string) error {
 	}
 	defer cli.Close()
 
-	resp, err := cli.MemberList(context.Background())
+	listResp, err := cli.MemberList(context.Background())
 	if err != nil {
 		log.Fatal(err)
 	}
-	logger.Info("members:", len(resp.Members))
+	//logger.Info("members:", listResp.Members)
+	nodes := []NodeInfo{}
+	for _, memb := range listResp.Members {
+		for _, u := range memb.PeerURLs {
+			n := memb.Name
+			re := regexp.MustCompile("([0-9]{1,3}[.]){3}[0-9]{1,3}")
+			match := re.FindStringSubmatch(u)
+			nodes = append(nodes, NodeInfo{
+				name:   n,
+				etcdIP: match[0],
+				kubeIP: "",
+			})
+		}
+	}
 
+	for _, v := range nodes {
+		logger.Infof("HostName: %s , EtcdIP: %s, KubeIP: %s", v.name, v.etcdIP, v.kubeIP)
+	}
 	return nil
 }
 
