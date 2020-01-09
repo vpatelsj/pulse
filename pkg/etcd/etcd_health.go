@@ -71,51 +71,19 @@ type VMSSNode struct {
 }
 
 func (e *EtcdHealthCheck) RunE(cmd *cobra.Command, _ []string) error {
-	e.CACertFile = EtcdV3CACertFile
-	e.CertFile = EtcdV3CertFile
-	e.CertKeyFile = EtcdV3KeyFile
 
 	logger, err := newLogger()
 	if err != nil {
 		return err
 	}
 
-	tlsParams := &transport.TLSInfo{
-		CAFile:   e.CACertFile,
-		CertFile: e.CertFile,
-		KeyFile:  e.CertKeyFile,
-	}
-
-	tlsConfig, err := tlsParams.ClientConfig()
-	if err != nil {
-		return err
-	}
-
-	logger.Info("Getting Etcd Cluster Info")
-	etcdClient, err := clientv3.New(clientv3.Config{
-		Endpoints: []string{"https://127.0.0.1:2379"},
-		TLS:       tlsConfig,
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer etcdClient.Close()
-
 	clusterNodes := ClusterNodes{}
 
-	clusterNodes.populateEtcdNodes(etcdClient)
-
-	kc, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{}).ClientConfig()
+	err = clusterNodes.populateEtcdNodes(e, logger)
 	if err != nil {
 		return err
 	}
-
-	kubeClient, err := kubernetes.NewForConfig(kc)
-	if err != nil {
-		return err
-	}
-
-	err = clusterNodes.populateKubeNodes(kubeClient)
+	err = clusterNodes.populateKubeNodes()
 	if err != nil {
 		return err
 	}
@@ -130,6 +98,10 @@ func (e *EtcdHealthCheck) RunE(cmd *cobra.Command, _ []string) error {
 			err1 := fmt.Sprintf("IP Mismatch for node %s", name)
 			return errors.New(err1)
 		}
+		if !etcdNode.healthy {
+			err1 := fmt.Sprintf("Etcd node is not healthy: %s", name)
+			return errors.New(err1)
+		}
 	}
 
 	for name, kubeNode := range clusterNodes.kubeNodes {
@@ -138,9 +110,12 @@ func (e *EtcdHealthCheck) RunE(cmd *cobra.Command, _ []string) error {
 			err1 := fmt.Sprintf("IP Mismatch for node %s", name)
 			return errors.New(err1)
 		}
+		if !kubeNode.ready {
+			err1 := fmt.Sprintf("Kube node is not ready: %s", name)
+			return errors.New(err1)
+		}
 	}
 
-	e.handleClusterHealth()
 	logger.Info("Etcd and Kube master node IP Matched")
 	return nil
 }
@@ -172,28 +147,17 @@ func newLogger() (*logrus.Logger, error) {
 	return res, nil
 }
 
-func (c *ClusterNodes) populateEtcdNodes(cli *clientv3.Client) {
-	listResp, err := cli.MemberList(context.Background())
+func (c *ClusterNodes) populateKubeNodes() error {
+
+	kc, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{}).ClientConfig()
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
-	nodes := make(map[string]ETCDNode, len(listResp.Members))
-	for _, memb := range listResp.Members {
-		for _, u := range memb.PeerURLs {
-			n := memb.Name
-			re := regexp.MustCompile("([0-9]{1,3}[.]){3}[0-9]{1,3}")
-			match := re.FindStringSubmatch(u)
-			nodes[n] = ETCDNode{
-				name: n,
-				ip:   match[0],
-			}
-		}
+	cli, err := kubernetes.NewForConfig(kc)
+	if err != nil {
+		return err
 	}
-	c.etcdNodes = nodes
-}
-
-func (c *ClusterNodes) populateKubeNodes(cli *kubernetes.Clientset) error {
 
 	kubeNodes, err := cli.CoreV1().Nodes().List(metav1.ListOptions{})
 	if err != nil {
@@ -229,16 +193,11 @@ func isReady(node v1.Node) bool {
 	return true
 }
 
-func (e *EtcdHealthCheck) handleClusterHealth() error {
+func (c *ClusterNodes) populateEtcdNodes(e *EtcdHealthCheck, logger *logrus.Logger) error {
 
 	e.CACertFile = EtcdV3CACertFile
 	e.CertFile = EtcdV3CertFile
 	e.CertKeyFile = EtcdV3KeyFile
-
-	logger, err := newLogger()
-	if err != nil {
-		return err
-	}
 
 	tlsParams := &transport.TLSInfo{
 		CAFile:   e.CACertFile,
@@ -251,7 +210,6 @@ func (e *EtcdHealthCheck) handleClusterHealth() error {
 		return err
 	}
 
-	logger.Info("Getting Etcd Cluster Info")
 	etcdClient, err := clientv3.New(clientv3.Config{
 		Endpoints: []string{"https://127.0.0.1:2379"},
 		TLS:       tlsConfig,
@@ -273,19 +231,23 @@ func (e *EtcdHealthCheck) handleClusterHealth() error {
 	hc := http.Client{
 		Transport: trans,
 	}
-
+	c.etcdNodes = make(map[string]ETCDNode, len(ms.Members))
 	healthyMembers := 0
 	for _, m := range ms.Members {
 		if len(m.ClientURLs) == 0 {
-			fmt.Printf("member %d is unreachable: no available published client urls\n", m.ID)
+			logger.Infof("member %d is unreachable: no available published client urls\n", m.ID)
 			continue
 		}
 
+		etcdNode := ETCDNode{
+			name:    m.Name,
+			healthy: false,
+		}
 		checked := false
 		for _, url := range m.ClientURLs {
 			resp, err := hc.Get(url + "/health")
 			if err != nil {
-				fmt.Printf("failed to check the health of member %d on %s: %v\n", m.ID, url, err)
+				logger.Infof("failed to check the health of member %d on %s: %v\n", m.ID, url, err)
 				continue
 			}
 
@@ -293,7 +255,7 @@ func (e *EtcdHealthCheck) handleClusterHealth() error {
 			nresult := struct{ Health bool }{}
 			bytes, err := ioutil.ReadAll(resp.Body)
 			if err != nil {
-				fmt.Printf("failed to check the health of member %d on %s: %v\n", m.ID, url, err)
+				logger.Infof("failed to check the health of member %d on %s: %v\n", m.ID, url, err)
 				continue
 			}
 			resp.Body.Close()
@@ -303,30 +265,35 @@ func (e *EtcdHealthCheck) handleClusterHealth() error {
 				err = json.Unmarshal(bytes, &nresult)
 			}
 			if err != nil {
-				fmt.Printf("failed to check the health of member %d on %s: %v\n", m.ID, url, err)
+				logger.Infof("failed to check the health of member %d on %s: %v\n", m.ID, url, err)
 				continue
 			}
 
 			checked = true
 			if result.Health == "true" || nresult.Health {
-				fmt.Printf("member %d is healthy: got healthy result from %s\n", m.ID, url)
+				logger.Infof("member %d is healthy: got healthy result from %s\n", m.ID, url)
+				etcdNode.healthy = true
+				re := regexp.MustCompile("([0-9]{1,3}[.]){3}[0-9]{1,3}")
+				match := re.FindStringSubmatch(url)
+				etcdNode.ip = match[0]
 				healthyMembers++
 			} else {
-				fmt.Printf("member %d is unhealthy: got unhealthy result from %s\n", m.ID, url)
+				logger.Infof("member %d is unhealthy: got unhealthy result from %s\n", m.ID, url)
 			}
 			break
 		}
 		if !checked {
-			fmt.Printf("member %d is unreachable: %v are all unreachable\n", m.ID, m.ClientURLs)
+			logger.Infof("member %d is unreachable: %v are all unreachable\n", m.ID, m.ClientURLs)
 		}
+		c.etcdNodes[m.Name] = etcdNode
 	}
 	switch healthyMembers {
 	case len(ms.Members):
-		fmt.Println("cluster is healthy")
+		logger.Info("etcd cluster is healthy")
 	case 0:
-		fmt.Println("cluster is unavailable")
+		logger.Info("etcd cluster is unavailable")
 	default:
-		fmt.Println("cluster is degraded")
+		logger.Info("etcd cluster is degraded")
 	}
 	return nil
 }
