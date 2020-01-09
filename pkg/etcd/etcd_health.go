@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"regexp"
+	"strings"
 
 	v1 "k8s.io/api/core/v1"
 
@@ -42,24 +43,27 @@ type NodeInfo struct {
 }
 
 type ClusterNodes struct {
-	etcdNodes []ETCDNode
-	kubeNodes []KubeNode
-	vmssNodes []VMSSNode
+	etcdNodes map[string]ETCDNode
+	kubeNodes map[string]KubeNode
+	vmssNodes map[string]VMSSNode
 }
 
 type ETCDNode struct {
-	name string
-	ip   string
+	healthy bool
+	ip      string
+	name    string
 }
 
 type KubeNode struct {
-	name string
-	ip   string
+	ready bool
+	name  string
+	ip    string
 }
 
 type VMSSNode struct {
-	name string
-	ip   string
+	name        string
+	ip          string
+	latestModel bool
 }
 
 func (e *EtcdHealthCheck) RunE(cmd *cobra.Command, _ []string) error {
@@ -115,6 +119,24 @@ func (e *EtcdHealthCheck) RunE(cmd *cobra.Command, _ []string) error {
 	if len(clusterNodes.kubeNodes) != len(clusterNodes.etcdNodes) {
 		return errors.New("Etcd and Kube Nodes count does not match")
 	}
+
+	for name, etcdNode := range clusterNodes.etcdNodes {
+		kubeNode, err := clusterNodes.kubeNodes[name]
+		if !err || kubeNode.ip != etcdNode.ip {
+			err1 := fmt.Sprintf("IP Mismatch for node %s", name)
+			return errors.New(err1)
+		}
+	}
+
+	for name, kubeNode := range clusterNodes.kubeNodes {
+		etcdNode, err := clusterNodes.etcdNodes[name]
+		if !err || kubeNode.ip != etcdNode.ip {
+			err1 := fmt.Sprintf("IP Mismatch for node %s", name)
+			return errors.New(err1)
+		}
+	}
+
+	logger.Info("Etcd and Kube master node IP Matched")
 	return nil
 }
 
@@ -151,37 +173,40 @@ func (c *ClusterNodes) populateEtcdNodes(cli *clientv3.Client) {
 		log.Fatal(err)
 	}
 
-	nodes := []ETCDNode{}
+	nodes := make(map[string]ETCDNode, len(listResp.Members))
 	for _, memb := range listResp.Members {
 		for _, u := range memb.PeerURLs {
 			n := memb.Name
 			re := regexp.MustCompile("([0-9]{1,3}[.]){3}[0-9]{1,3}")
 			match := re.FindStringSubmatch(u)
-			nodes = append(nodes, ETCDNode{
+			nodes[n] = ETCDNode{
 				name: n,
 				ip:   match[0],
-			})
+			}
 		}
 	}
 	c.etcdNodes = nodes
 }
 
 func (c *ClusterNodes) populateKubeNodes(cli *kubernetes.Clientset) error {
-	nodes := []KubeNode{}
+
 	kubeNodes, err := cli.CoreV1().Nodes().List(metav1.ListOptions{})
 	if err != nil {
 		return err
 	}
 
+	nodes := make(map[string]KubeNode, len(kubeNodes.Items))
 	for _, n := range kubeNodes.Items {
-		nodeIp, err := GetNodeHostIP(&n)
-		if err != nil {
-			return err
+		if strings.Contains(n.Name, "master") {
+			nodeIp, err := GetNodeHostIP(&n)
+			if err != nil {
+				return err
+			}
+			nodes[n.Name] = KubeNode{
+				name: n.Name,
+				ip:   nodeIp,
+			}
 		}
-		nodes = append(nodes, KubeNode{
-			name: n.Name,
-			ip:   nodeIp,
-		})
 	}
 	c.kubeNodes = nodes
 	return nil
