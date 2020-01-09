@@ -2,14 +2,23 @@ package etcd
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"os"
 	"regexp"
+
+	v1 "k8s.io/api/core/v1"
+
+	"k8s.io/client-go/tools/clientcmd"
+
+	"k8s.io/client-go/kubernetes"
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/pkg/transport"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
@@ -30,6 +39,27 @@ type NodeInfo struct {
 	name   string
 	etcdIP string
 	kubeIP string
+}
+
+type ClusterNodes struct {
+	etcdNodes []ETCDNode
+	kubeNodes []KubeNode
+	vmssNodes []VMSSNode
+}
+
+type ETCDNode struct {
+	name string
+	ip   string
+}
+
+type KubeNode struct {
+	name string
+	ip   string
+}
+
+type VMSSNode struct {
+	name string
+	ip   string
 }
 
 func (e *EtcdHealthCheck) RunE(cmd *cobra.Command, _ []string) error {
@@ -54,38 +84,50 @@ func (e *EtcdHealthCheck) RunE(cmd *cobra.Command, _ []string) error {
 	}
 
 	logger.Info("Getting Etcd Cluster Info")
-	cli, err := clientv3.New(clientv3.Config{
+	etcdClient, err := clientv3.New(clientv3.Config{
 		Endpoints: []string{"https://127.0.0.1:2379"},
 		TLS:       tlsConfig,
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer cli.Close()
+	defer etcdClient.Close()
 
-	listResp, err := cli.MemberList(context.Background())
+	clusterNodes := ClusterNodes{}
+
+	clusterNodes.populateEtcdNodes(etcdClient)
+
+	kc, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{}).ClientConfig()
 	if err != nil {
-		log.Fatal(err)
-	}
-	//logger.Info("members:", listResp.Members)
-	nodes := []NodeInfo{}
-	for _, memb := range listResp.Members {
-		for _, u := range memb.PeerURLs {
-			n := memb.Name
-			re := regexp.MustCompile("([0-9]{1,3}[.]){3}[0-9]{1,3}")
-			match := re.FindStringSubmatch(u)
-			nodes = append(nodes, NodeInfo{
-				name:   n,
-				etcdIP: match[0],
-				kubeIP: "",
-			})
-		}
+		return err
 	}
 
-	for _, v := range nodes {
-		logger.Infof("HostName: %s , EtcdIP: %s, KubeIP: %s", v.name, v.etcdIP, v.kubeIP)
+	kubeClient, err := kubernetes.NewForConfig(kc)
+	if err != nil {
+		return err
+	}
+
+	err = clusterNodes.populateKubeNodes(kubeClient)
+	if err != nil {
+		return err
+	}
+	logger.Info(clusterNodes)
+	if len(clusterNodes.kubeNodes) != len(clusterNodes.etcdNodes) {
+		return errors.New("Etcd and Kube Nodes count does not match")
 	}
 	return nil
+}
+
+func GetNodeHostIP(node *v1.Node) (string, error) {
+	addresses := node.Status.Addresses
+	addressMap := make(map[v1.NodeAddressType][]v1.NodeAddress)
+	for i := range addresses {
+		addressMap[addresses[i].Type] = append(addressMap[addresses[i].Type], addresses[i])
+	}
+	if addresses, ok := addressMap[v1.NodeInternalIP]; ok {
+		return addresses[0].Address, nil
+	}
+	return "", fmt.Errorf("host IP unknown; known addresses: %v", addresses)
 }
 
 func newLogger() (*logrus.Logger, error) {
@@ -101,4 +143,46 @@ func newLogger() (*logrus.Logger, error) {
 	res.SetFormatter(&logrus.TextFormatter{})
 
 	return res, nil
+}
+
+func (c *ClusterNodes) populateEtcdNodes(cli *clientv3.Client) {
+	listResp, err := cli.MemberList(context.Background())
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	nodes := []ETCDNode{}
+	for _, memb := range listResp.Members {
+		for _, u := range memb.PeerURLs {
+			n := memb.Name
+			re := regexp.MustCompile("([0-9]{1,3}[.]){3}[0-9]{1,3}")
+			match := re.FindStringSubmatch(u)
+			nodes = append(nodes, ETCDNode{
+				name: n,
+				ip:   match[0],
+			})
+		}
+	}
+	c.etcdNodes = nodes
+}
+
+func (c *ClusterNodes) populateKubeNodes(cli *kubernetes.Clientset) error {
+	nodes := []KubeNode{}
+	kubeNodes, err := cli.CoreV1().Nodes().List(metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+
+	for _, n := range kubeNodes.Items {
+		nodeIp, err := GetNodeHostIP(&n)
+		if err != nil {
+			return err
+		}
+		nodes = append(nodes, KubeNode{
+			name: n.Name,
+			ip:   nodeIp,
+		})
+	}
+	c.kubeNodes = nodes
+	return nil
 }
