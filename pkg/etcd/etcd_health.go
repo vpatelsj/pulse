@@ -2,12 +2,16 @@ package etcd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 
@@ -136,6 +140,7 @@ func (e *EtcdHealthCheck) RunE(cmd *cobra.Command, _ []string) error {
 		}
 	}
 
+	e.handleClusterHealth()
 	logger.Info("Etcd and Kube master node IP Matched")
 	return nil
 }
@@ -203,11 +208,125 @@ func (c *ClusterNodes) populateKubeNodes(cli *kubernetes.Clientset) error {
 				return err
 			}
 			nodes[n.Name] = KubeNode{
-				name: n.Name,
-				ip:   nodeIp,
+				name:  n.Name,
+				ip:    nodeIp,
+				ready: isReady(n),
 			}
 		}
 	}
 	c.kubeNodes = nodes
+	return nil
+}
+
+func isReady(node v1.Node) bool {
+	for _, cond := range node.Status.Conditions {
+		if cond.Type == v1.NodeReady {
+			if cond.Status != v1.ConditionTrue {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (e *EtcdHealthCheck) handleClusterHealth() error {
+
+	e.CACertFile = EtcdV3CACertFile
+	e.CertFile = EtcdV3CertFile
+	e.CertKeyFile = EtcdV3KeyFile
+
+	logger, err := newLogger()
+	if err != nil {
+		return err
+	}
+
+	tlsParams := &transport.TLSInfo{
+		CAFile:   e.CACertFile,
+		CertFile: e.CertFile,
+		KeyFile:  e.CertKeyFile,
+	}
+
+	tlsConfig, err := tlsParams.ClientConfig()
+	if err != nil {
+		return err
+	}
+
+	logger.Info("Getting Etcd Cluster Info")
+	etcdClient, err := clientv3.New(clientv3.Config{
+		Endpoints: []string{"https://127.0.0.1:2379"},
+		TLS:       tlsConfig,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer etcdClient.Close()
+
+	ms, err := etcdClient.MemberList(context.TODO())
+	if err != nil {
+		fmt.Println("cluster may be unhealthy: failed to list members")
+		return err
+	}
+	trans, err := transport.NewTransport(*tlsParams, 30*time.Second)
+	if err != nil {
+		return err
+	}
+	hc := http.Client{
+		Transport: trans,
+	}
+
+	healthyMembers := 0
+	for _, m := range ms.Members {
+		if len(m.ClientURLs) == 0 {
+			fmt.Printf("member %d is unreachable: no available published client urls\n", m.ID)
+			continue
+		}
+
+		checked := false
+		for _, url := range m.ClientURLs {
+			resp, err := hc.Get(url + "/health")
+			if err != nil {
+				fmt.Printf("failed to check the health of member %d on %s: %v\n", m.ID, url, err)
+				continue
+			}
+
+			result := struct{ Health string }{}
+			nresult := struct{ Health bool }{}
+			bytes, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				fmt.Printf("failed to check the health of member %d on %s: %v\n", m.ID, url, err)
+				continue
+			}
+			resp.Body.Close()
+
+			err = json.Unmarshal(bytes, &result)
+			if err != nil {
+				err = json.Unmarshal(bytes, &nresult)
+			}
+			if err != nil {
+				fmt.Printf("failed to check the health of member %d on %s: %v\n", m.ID, url, err)
+				continue
+			}
+
+			checked = true
+			if result.Health == "true" || nresult.Health {
+				fmt.Printf("member %d is healthy: got healthy result from %s\n", m.ID, url)
+				healthyMembers++
+			} else {
+				fmt.Printf("member %d is unhealthy: got unhealthy result from %s\n", m.ID, url)
+			}
+			break
+		}
+		if !checked {
+			fmt.Printf("member %d is unreachable: %v are all unreachable\n", m.ID, m.ClientURLs)
+		}
+	}
+	switch healthyMembers {
+	case len(ms.Members):
+		fmt.Println("cluster is healthy")
+	case 0:
+		fmt.Println("cluster is unavailable")
+	default:
+		fmt.Println("cluster is degraded")
+	}
 	return nil
 }
